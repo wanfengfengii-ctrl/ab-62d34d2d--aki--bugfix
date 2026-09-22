@@ -39,6 +39,8 @@ OID_PKCS1_SHA1 = "1.2.840.113549.1.1.5"
 OID_EC_PUBLIC_KEY = "1.2.840.10045.2.1"
 OID_RSA_KEY = "1.2.840.113549.1.1.1"
 OID_ED25519 = "1.3.101.112"
+OID_SKI = "2.5.29.14"
+OID_AKI = "2.5.29.35"
 
 
 def fp_of(der_bytes: bytes) -> str:
@@ -547,6 +549,95 @@ def cheap_names(cert_der: bytes) -> tuple[bytes, bytes]:
     issuer = der.build_tlv(t[i + 2][0], t[i + 2][1])
     subject = der.build_tlv(t[i + 4][0], t[i + 4][1])
     return issuer, subject
+
+
+@dataclasses.dataclass(frozen=True)
+class CheapIdentity:
+    """Identity material extracted from raw DER with zero crypto work:
+
+    issuer/subject Name DER, SKI/AKI key identifiers (None when absent) and
+    the subjectPublicKey BIT STRING content (raw key bytes). Used for the
+    constant-time AKI-scoped issuer index at seal time."""
+
+    issuer_der: bytes
+    subject_der: bytes
+    ski: bytes | None
+    aki: bytes | None
+    spki_bitstring: bytes
+
+
+def _cheap_extension_octets(tbs_elems, want_oid: str) -> bytes | None:
+    """Return the extnValue OCTET STRING payload for extension ``want_oid``
+    from raw TBS elements, or None when the extension is absent."""
+    for tag, val in tbs_elems:
+        if tag != 0xA3:  # [3] EXPLICIT Extensions
+            continue
+        ext_tag, ext_body, _ = der.tlv(val)
+        if ext_tag != der.SEQUENCE:
+            raise MalformedEvidenceError("extensions: expected SEQUENCE")
+        for _et, ext_val in der.iter_tlv(ext_body):
+            parts = list(der.iter_tlv(ext_val))
+            if len(parts) < 2 or parts[0][0] != der.OID:
+                raise MalformedEvidenceError("extension: bad structure")
+            oid = der.decode_oid(parts[0][1])
+            # parts: OID, [BOOLEAN critical?], OCTET STRING extnValue
+            value_part = parts[-1]
+            if value_part[0] != der.OCTET_STRING:
+                raise MalformedEvidenceError("extension: extnValue must be OCTET STRING")
+            if oid == want_oid:
+                return value_part[1]
+        return None
+    return None
+
+
+def _cheap_ski(tbs_elems) -> bytes | None:
+    payload = _cheap_extension_octets(tbs_elems, OID_SKI)
+    if payload is None:
+        return None
+    tag, val, _ = der.tlv(payload)
+    if tag != der.OCTET_STRING or not val:
+        raise MalformedEvidenceError("subjectKeyIdentifier: bad encoding")
+    return val
+
+
+def _cheap_aki(tbs_elems) -> bytes | None:
+    payload = _cheap_extension_octets(tbs_elems, OID_AKI)
+    if payload is None:
+        return None
+    tag, seq, _ = der.tlv(payload)
+    if tag != der.SEQUENCE:
+        raise MalformedEvidenceError("authorityKeyIdentifier: expected SEQUENCE")
+    for member_tag, member_val in der.iter_tlv(seq):
+        if member_tag == 0x80 and member_val:  # [0] keyIdentifier
+            return member_val
+    return None
+
+
+def cheap_identity(cert_der: bytes) -> CheapIdentity:
+    """Extract issuer/subject Name, SKI, AKI keyIdentifier and the raw
+    subjectPublicKey bytes without any cryptographic parsing."""
+    issuer, subject = cheap_names(cert_der)
+    tag, body, _ = der.tlv(cert_der)
+    tbs = list(der.iter_tlv(body))[0][1]
+    tbs_elems = list(der.iter_tlv(tbs))
+    i = 1 if tbs_elems and tbs_elems[0][0] == 0xA0 else 0
+    # serial i, signature i+1, issuer i+2, validity i+3, subject i+4,
+    # subjectPublicKeyInfo i+5; element value is the SPKI SEQUENCE body.
+    if len(tbs_elems) < i + 6:
+        raise MalformedEvidenceError("certificate: truncated TBS")
+    spki_tag, spki_body = tbs_elems[i + 5]
+    if spki_tag != der.SEQUENCE:
+        raise MalformedEvidenceError("subjectPublicKeyInfo: expected SEQUENCE")
+    spki_parts = list(der.iter_tlv(spki_body))
+    if len(spki_parts) < 2 or spki_parts[1][0] != der.BIT_STRING:
+        raise MalformedEvidenceError("subjectPublicKeyInfo: bad structure")
+    bitval = spki_parts[1][1]
+    if not bitval:
+        raise MalformedEvidenceError("subjectPublicKeyInfo: empty BIT STRING")
+    return CheapIdentity(
+        issuer_der=issuer, subject_der=subject,
+        ski=_cheap_ski(tbs_elems), aki=_cheap_aki(tbs_elems),
+        spki_bitstring=bitval[1:])
 
 
 def is_self_signed(pc: ParsedCert) -> bool:

@@ -19,7 +19,6 @@ changes a hash or the recomputed result, so verification fails.
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import io
 import json
@@ -34,9 +33,8 @@ from app.loader import LoadedSet
 class ZipSource:
     """Minimal store-like object backed solely by the ZIP's blobs."""
 
-    def __init__(self, files: dict[str, bytes], name_index: dict):
+    def __init__(self, files: dict[str, bytes]):
         self.files = files
-        self._name_index = name_index
         self.root = ""
 
     def get_blob(self, digest: str) -> bytes:
@@ -48,19 +46,28 @@ class ZipSource:
 
 
 class ZipLoadedSet(LoadedSet):
-    def __init__(self, source, manifest):
+    def __init__(self, source, manifest, index_version=None):
         super().__init__(source, manifest)
+        self._forced_index_version = index_version
 
     def _name_index_path(self) -> str:
         return ""  # unused
 
-    def _subject_name_index(self) -> dict[bytes, list[str]]:
-        import base64 as b64
+    def _read_sidecar(self) -> dict | None:
+        return None  # rebuilt in-memory; see _name_index
 
-        idx: dict[bytes, list[str]] = {}
-        for name_b64, digests in self.store._name_index.items():
-            idx[b64.b64decode(name_b64)] = digests
-        return idx
+    def _name_index(self):
+        from app.nameindex import NameIndex, build_sidecar
+
+        digests = self.content["certificates"]
+        raw = build_sidecar(digests, self.get_blob)
+        index = NameIndex.from_sidecar(raw)
+        if self._forced_index_version is not None:
+            # Honor the scoping semantics of the original archive: a v1
+            # archive always did the full same-name bucket scan.
+            index.version = self._forced_index_version
+        self._name_idx = index
+        return index
 
 
 def _fail(checks, name, ok, detail=""):
@@ -151,28 +158,19 @@ def verify_package(path: str) -> dict:
     rerun_ok = False
     rerun_detail = ""
     try:
-        # Build a name index from packaged certs via cheap DER extraction.
-        from app.certmodel import cheap_names
-        from app.errors import MalformedEvidenceError
-
-        name_index: dict[str, list[str]] = {}
-        cert_digests = set_manifest["content"]["certificates"]
-        cert_files = {d: files[f"der/certificates/{d}.der"]
-                      for d in cert_digests
-                      if f"der/certificates/{d}.der" in files}
-        for d, raw in cert_files.items():
-            try:
-                _i, subject = cheap_names(raw)
-            except MalformedEvidenceError:
-                continue
-            name_index.setdefault(base64.b64encode(subject).decode(), []).append(d)
-
         # The core must see exactly the sealed content universe; certificates
         # not bundled (unrelated 100k) are irrelevant: restrict content lists
         # to what path/revocation can reference, i.e. the packaged subset, BUT
         # the content digest was computed over the full list. Re-running with
         # the packaged subset is valid because path search only reaches
-        # bundled certificates (all path/proof certs are bundled).
+        # bundled certificates (all path/proof certs are bundled). The v2
+        # identity index is rebuilt from the packaged raw DER inside the
+        # ZipLoadedSet so online/offline AKI scoping is identical.
+        cert_digests = set_manifest["content"]["certificates"]
+        cert_files = {d: files[f"der/certificates/{d}.der"]
+                      for d in cert_digests
+                      if f"der/certificates/{d}.der" in files}
+
         rerun_manifest = {
             "evidence_set_id": set_manifest["evidence_set_id"],
             "content_digest": set_manifest["content_digest"],
@@ -183,8 +181,9 @@ def verify_package(path: str) -> dict:
                 "ocsps": set_manifest["content"]["ocsps"],
             },
         }
-        source = ZipSource(files, name_index)
-        loaded = ZipLoadedSet(source, rerun_manifest)
+        source = ZipSource(files)
+        index_version = pkg_manifest.get("identity_index_version")
+        loaded = ZipLoadedSet(source, rerun_manifest, index_version)
         rerun = run_core(loaded, rerun_manifest, req)
         # Determinism: recomputed result must byte-match result.json after
         # we swap identity fields (set content digest identical already).

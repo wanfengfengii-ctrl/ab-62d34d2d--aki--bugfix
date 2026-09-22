@@ -95,6 +95,10 @@ def build_package(store, result: dict, set_manifest: dict | None = None) -> byte
     result_bytes = canonical.dumps(result)
     package_manifest = {
         "format": "forensic-evidence-package/v1",
+        # Identity-index version applied online; the offline verifier must
+        # honor the same scoping semantics (v1 => full name-bucket scan).
+        "identity_index_version": (
+            (result.get("processing") or {}).get("index_version") or 2),
         "members": [{"name": n, "sha256": __import__("hashlib").sha256(d).hexdigest(),
                      "length": len(d)} for n, d in members],
         "result_sha256": __import__("hashlib").sha256(result_bytes).hexdigest(),

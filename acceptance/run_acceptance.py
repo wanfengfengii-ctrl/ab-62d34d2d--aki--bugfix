@@ -250,6 +250,118 @@ def main() -> int:
     check("out-of-profile P-384 -> structured UNSUPPORTED",
           r.status_code == 422 and r.json()["error"]["code"] == "UNSUPPORTED")
 
+    # ----------------- AKI-scoped same-subject decoy scenario -----------
+    # 256 self-signed CAs with the exact subject DN of the real Target CA but
+    # different keys/SKIs; the leaf's AKI names the real CA only. The verdict
+    # must stay VALID while full (crypto) parsing stays at root/CA/leaf.
+    r = httpx.post(API1 + "/api/v1/evidence-sets",
+                   json={"client_request_id": "accept-aki-create"})
+    asid = r.json()["evidence_set_id"]
+    ark, ack, alk = pf.gen_key(), pf.gen_key(), pf.gen_key()
+    aroot = pf.build_cert("AKI Target Root", None, ark, ark, is_ca=True,
+                          key_usage=("keyCertSign", "cRLSign"),
+                          policies=[ANY], self_signed=True)
+    aca = pf.build_cert("AKI Target CA", aroot, ack, ark, is_ca=True,
+                        key_usage=("keyCertSign", "cRLSign"), policies=[ANY])
+    aleaf = pf.build_cert("aki.leaf.acceptance.test", aca, alk, ack,
+                          key_usage=("digitalSignature",),
+                          eku=("codeSigning",), policies=[ANY],
+                          san_dns=("aki.leaf.acceptance.test",))
+    acrl = pf.build_crl(aca, ack, [], last_update=SIGNED - 100,
+                        next_update=SIGNED + 100, crl_number=1)
+    arcrl = pf.build_crl(aroot, ark, [], last_update=SIGNED - 100,
+                         next_update=SIGNED + 100, crl_number=1)
+    N_DECOY = 256
+    aitems = [{"client_ref": f"c-{ref}", "type": "certificate",
+               "content_base64": b64(c)}
+              for ref, c in (("root", aroot), ("ca", aca), ("leaf", aleaf))]
+    for i in range(N_DECOY):
+        dk = pf.gen_key()
+        decoy = pf.build_cert("AKI Target CA", None, dk, dk, is_ca=True,
+                              key_usage=("keyCertSign", "cRLSign"),
+                              policies=[ANY], self_signed=True)
+        aitems.append({"client_ref": f"decoy{i:04d}", "type": "certificate",
+                       "content_base64": b64(decoy)})
+    aitems += [{"client_ref": "acrl", "type": "crl",
+                "content_base64": b64(acrl)},
+               {"client_ref": "arcrl", "type": "crl",
+                "content_base64": b64(arcrl)}]
+    r = httpx.post(f"{API1}/api/v1/evidence-sets/{asid}/items",
+                   json={"client_request_id": "aki-items",
+                         "received_at": RECEIVED, "items": aitems})
+    check("AKI decoy set upload (3 + 256 certs, 2 CRLs)",
+          r.status_code == 200 and r.json()["accepted"] == len(aitems))
+    httpx.post(f"{API2}/api/v1/evidence-sets/{asid}/seal",
+               json={"client_request_id": "aki-seal"})
+    adigest = hashlib.sha256(b"aki-artifact").digest()
+    asig = alk.sign(adigest, ec.ECDSA(Prehashed(hashes.SHA256())))
+    areq = {"client_request_id": "aki-adj",
+            "artifact_digest": adigest.hex(), "signature": asig.hex(),
+            "signature_algorithm": "1.2.840.10045.4.3.2",
+            "signed_at": SIGNED, "knowledge_cutoff": CUTOFF,
+            "leaf_certificate_sha256": fp_of(pf.der(aleaf)),
+            "initial_policies": [ANY],
+            "trust_anchors": [fp_of(pf.der(aroot))]}
+    r1 = httpx.post(f"{API1}/api/v1/evidence-sets/{asid}/adjudications",
+                    json=areq)
+    decoy_ok = (r1.status_code == 201
+                and r1.json()["verdict"]["status"] == "VALID")
+    check(f"256 same-subject decoy CAs still VALID", decoy_ok, r1.text[:200])
+    parsed1 = r1.json().get("processing", {}).get("certs_fully_parsed")
+    check("full parsing constant (root/CA/leaf only, decoys skipped)",
+          parsed1 == 3, f"certs_fully_parsed={parsed1}")
+
+    # Switch to the second instance (fresh process view on the shared
+    # volume): same request must replay byte-for-byte with identical work.
+    areq2 = dict(areq)
+    areq2["client_request_id"] = "aki-adj-api2"
+    r2 = httpx.post(f"{API2}/api/v1/evidence-sets/{asid}/adjudications",
+                    json=areq2)
+    same = (r2.status_code == 201 and r2.content == r1.content)
+    check("instance switch re-adjudication byte-identical", same,
+          r2.text[:200])
+
+    # No AKI on the leaf: the whole same-name candidate set is examined;
+    # verdict still VALID (decoy signatures simply do not verify), but the
+    # full parse volume now includes every same-name CA.
+    r = httpx.post(API1 + "/api/v1/evidence-sets",
+                   json={"client_request_id": "accept-noaki-create"})
+    nsid = r.json()["evidence_set_id"]
+    nleaf = pf.build_cert("noaki.leaf.acceptance.test", aca, alk, ack,
+                          key_usage=("digitalSignature",),
+                          eku=("codeSigning",), policies=[ANY],
+                          add_aki=False)
+    nitems = [{"client_ref": f"n-{ref}", "type": "certificate",
+               "content_base64": b64(c)}
+              for ref, c in (("root", aroot), ("ca", aca), ("leaf", nleaf))]
+    nitems += aitems[3:3 + N_DECOY]
+    nitems += [{"client_ref": "nacrl", "type": "crl",
+                "content_base64": b64(acrl)},
+               {"client_ref": "narcrl", "type": "crl",
+                "content_base64": b64(arcrl)}]
+    httpx.post(f"{API1}/api/v1/evidence-sets/{nsid}/items",
+               json={"client_request_id": "noaki-items",
+                     "received_at": RECEIVED, "items": nitems})
+    httpx.post(f"{API1}/api/v1/evidence-sets/{nsid}/seal",
+               json={"client_request_id": "noaki-seal"})
+    ndigest = hashlib.sha256(b"noaki-artifact").digest()
+    nsig = alk.sign(ndigest, ec.ECDSA(Prehashed(hashes.SHA256())))
+    nreq = {"client_request_id": "noaki-adj",
+            "artifact_digest": ndigest.hex(), "signature": nsig.hex(),
+            "signature_algorithm": "1.2.840.10045.4.3.2",
+            "signed_at": SIGNED, "knowledge_cutoff": CUTOFF,
+            "leaf_certificate_sha256": fp_of(pf.der(nleaf)),
+            "initial_policies": [ANY],
+            "trust_anchors": [fp_of(pf.der(aroot))]}
+    r = httpx.post(f"{API1}/api/v1/evidence-sets/{nsid}/adjudications",
+                   json=nreq)
+    nparsed = r.json().get("processing", {}).get("certs_fully_parsed")
+    check("no-AKI leaf VALID and full same-name set examined",
+          r.status_code == 201
+          and r.json()["verdict"]["status"] == "VALID"
+          and nparsed == 3 + N_DECOY,
+          f"status={r.status_code} certs_fully_parsed={nparsed}")
+
     print("-" * 64)
     failed = [x for x in results if x[0] == FAIL]
     print(f"acceptance: {len(results) - len(failed)}/{len(results)} passed")

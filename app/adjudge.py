@@ -147,6 +147,20 @@ def run_core(loaded: LoadedSet, manifest: dict, req: dict) -> dict:
                    outcome=outcome, engine=engine, graph=graph)
 
 
+def _processing_stats(loaded: LoadedSet) -> dict:
+    """Deterministic accounting of full (crypto) certificate parsing done by
+    this adjudication. Independent of same-name certificates whose SKI does
+    not match the child's AKI: the count is constant in the decoy population.
+    """
+    attempted = sorted(loaded._parsed)
+    return {
+        "certs_fully_parsed": len(attempted),
+        "certificates": attempted,
+        "index_version": getattr(getattr(loaded, "_name_idx", None),
+                                 "version", None),
+    }
+
+
 def _result(manifest, req, request_digest, anchor_checks, loaded,
             early=None, outcome=None, engine=None, graph=None) -> dict:
     rules = [
@@ -233,6 +247,7 @@ def _result(manifest, req, request_digest, anchor_checks, loaded,
         "evidence_set_content_digest": manifest["content_digest"],
         "request_digest": request_digest,
     }
+    result["processing"] = _processing_stats(loaded)
     result["final_digest"] = _final_digest(result)
     return result
 

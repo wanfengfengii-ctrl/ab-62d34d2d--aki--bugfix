@@ -4,6 +4,12 @@ Certificates are parsed on first access (the acceptance load has 100k certs
 but adjudicates a handful of leaves); revocation objects are parsed eagerly
 (max 2,000) since the limits make that cheap and they are always needed for
 evidence logging.
+
+Issuer resolution is AKI-scoped: when a child carries an AKI keyIdentifier,
+only same-subject certificates whose SKI matches (or that have no SKI, or that
+share a public key with such a candidate — same-key cross-signs) are ever
+fully parsed. Without an AKI the whole same-name candidate set is still
+examined, per RFC 5280 compatibility rules.
 """
 from __future__ import annotations
 
@@ -11,6 +17,7 @@ from . import evidence as ev
 from .certmodel import ParsedCert, parse_certificate
 from .errors import MalformedEvidenceError, UnsupportedError
 from .graph import CertGraph
+from .nameindex import NameIndex, build_sidecar
 
 
 class LoadedSet:
@@ -83,21 +90,19 @@ class LoadedSet:
 
         graph = LazyGraph(self, anchor_digests)
 
-        # Override candidate lookup to lazily parse: find certs whose SUBJECT
-        # equals child's issuer DN. That needs an index by subject name, so we
-        # build name buckets from raw DER cheaply using cached ParsedCert where
-        # available, parsing only issuers reachable by name. To find issuers by
-        # name without parsing all certificates, maintain a precomputed name
-        # index (built during ingestion; see store detail). Fallback: parse all
-        # when the index is absent (older stores).
-        index = self._subject_name_index()
-        graph._subject_index = index
+        # Issuer lookup is driven by the seal-time identity index. With an
+        # AKI it is narrowed to SKI-matching / SKI-less / same-key issuers
+        # (constant in the number of non-matching same-name decoys); without
+        # an AKI, or when only the old name-only sidecar exists, the whole
+        # name bucket is examined. A missing sidecar falls back to parsing
+        # all certificates of the sealed set (stores predating indexes).
+        index = self._name_index()
 
         def candidate_issuers(child_fp: str) -> list[str]:
             child = graph.certs.get(child_fp) or self.cert(child_fp)
             if child is None:
                 return []
-            digests = index.get(child.issuer_der, [])
+            digests = index.select(child.issuer_der, child.aki)
             out = []
             for d in digests:
                 pc = graph._materialize(d)
@@ -107,46 +112,46 @@ class LoadedSet:
 
         graph.candidate_issuers = candidate_issuers  # type: ignore[assignment]
 
-        # by_issuer used by revocation engine: resolve by name + AKI.
+        # by_issuer used by the revocation engine: resolve by name + AKI
+        # with the exact same scoping semantics, so online and offline runs
+        # do identical work.
         def by_issuer(name_der, aki):
             res = []
-            for d in index.get(name_der, []):
+            for d in index.select(name_der, aki):
                 pc = graph._materialize(d)
-                if pc is None:
-                    continue
-                if aki is not None and pc.ski is not None and pc.ski != aki:
-                    continue
-                res.append(pc)
+                if pc is not None:
+                    res.append(pc)
             return res
 
         graph.by_issuer = by_issuer  # type: ignore[assignment]
         return graph
 
-    def _subject_name_index(self) -> dict[bytes, list[str]]:
-        """Use the cheap index materialized at seal time (raw Name DER keys,
-        base64 encoded in the sidecar file)."""
-        import base64
-        import json
-        import os
-
+    def _name_index(self) -> NameIndex:
+        """Identity index from the seal-time sidecar; rebuild in memory when
+        the v1 sidecar exists or no sidecar was written (old stores)."""
         cached = getattr(self, "_name_idx", None)
         if cached is not None:
             return cached
-        idx_path = self._name_index_path()
-        idx: dict[bytes, list[str]] = {}
-        if os.path.exists(idx_path):
-            with open(idx_path) as f:
-                raw_index = json.load(f)
-            for name_b64, digests in raw_index.items():
-                idx[base64.b64decode(name_b64)] = digests
+        raw = self._read_sidecar()
+        if raw is not None:
+            index = NameIndex.from_sidecar(raw)
         else:
             # Slow fallback for stores sealed before sidecars existed.
-            for d in self.content["certificates"]:
-                pc = self.cert(d)
-                if pc is not None:
-                    idx.setdefault(pc.subject_der, []).append(d)
-        self._name_idx = idx
-        return idx
+            digests = self.content["certificates"]
+            raw = build_sidecar(digests, self.get_blob)
+            index = NameIndex.from_sidecar(raw)
+        self._name_idx = index
+        return index
+
+    def _read_sidecar(self) -> dict | None:
+        import json
+        import os
+
+        idx_path = self._name_index_path()
+        if not os.path.exists(idx_path):
+            return None
+        with open(idx_path) as f:
+            return json.load(f)
 
     def _name_index_path(self) -> str:
         import os

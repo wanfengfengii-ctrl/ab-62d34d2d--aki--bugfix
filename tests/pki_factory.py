@@ -55,7 +55,8 @@ def build_cert(subject_cn, issuer_obj, subject_key, issuer_key, *,
                require_explicit_policy=None, inhibit_policy_mapping=None,
                inhibit_any_policy=None, sig_alg="sha256",
                issuer_ski_override=None, self_signed=False,
-               subject_dn_extra=()):
+               subject_dn_extra=(), add_ski=True, add_aki=True,
+               ski_override=None):
     """issuer_obj: certificate used to derive issuer Name + AKI (or None to
     self-issue). Returns an x509.Certificate."""
     subject_name_attrs = [x509.NameAttribute(NameOID.COMMON_NAME, subject_cn)]
@@ -78,19 +79,26 @@ def build_cert(subject_cn, issuer_obj, subject_key, issuer_key, *,
         .serial_number(serial)
         .not_valid_before(utc(not_before))
         .not_valid_after(utc(not_after))
-        .add_extension(
-            x509.SubjectKeyIdentifier.from_public_key(subject_key.public_key()),
-            critical=False)
     )
-    if self_signed:
-        aki = x509.AuthorityKeyIdentifier.from_issuer_public_key(subject_key.public_key())
-    elif issuer_ski_override is not None:
-        aki = x509.AuthorityKeyIdentifier(
-            key_identifier=issuer_ski_override,
-            authority_cert_issuer=None, authority_cert_serial_number=None)
-    else:
-        aki = x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_key.public_key())
-    builder = builder.add_extension(aki, critical=False)
+    if add_ski:
+        ski_value = (x509.SubjectKeyIdentifier(ski_override)
+                     if ski_override is not None
+                     else x509.SubjectKeyIdentifier.from_public_key(
+                         subject_key.public_key()))
+        builder = builder.add_extension(ski_value, critical=False)
+
+    if add_aki:
+        if self_signed:
+            aki = x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                subject_key.public_key())
+        elif issuer_ski_override is not None:
+            aki = x509.AuthorityKeyIdentifier(
+                key_identifier=issuer_ski_override,
+                authority_cert_issuer=None, authority_cert_serial_number=None)
+        else:
+            aki = x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                issuer_key.public_key())
+        builder = builder.add_extension(aki, critical=False)
 
     bc = x509.BasicConstraints(ca=is_ca, path_length=path_len)
     builder = builder.add_extension(bc, critical=True)

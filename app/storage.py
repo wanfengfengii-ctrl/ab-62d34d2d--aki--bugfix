@@ -274,20 +274,12 @@ class Store:
                     raise ConflictError("resource limit exceeded",
                                         {"limit": "crl_ocsp_evidence", "max": 2_000,
                                          "actual": n_rev})
-                # Cheap subject-name index for lazy graph construction.
-                import base64
+                # Cheap subject-name/identity index for lazy graph
+                # construction (raw DER extraction, no crypto parsing).
+                from .nameindex import build_sidecar
 
-                from .certmodel import cheap_names
-                from .errors import MalformedEvidenceError
-
-                name_index: dict[str, list[str]] = {}
-                for x in groups["certificate"]:
-                    d = x["sha256"]
-                    try:
-                        _issuer, subject = cheap_names(self.get_blob(d))
-                    except MalformedEvidenceError:
-                        continue
-                    name_index.setdefault(base64.b64encode(subject).decode(), []).append(d)
+                cert_digests = [x["sha256"] for x in groups["certificate"]]
+                sidecar = build_sidecar(cert_digests, self.get_blob)
                 total_revocation_entries = 0
                 for x in groups["crl"]:
                     from cryptography import x509 as _x509
@@ -320,13 +312,14 @@ class Store:
                     (manifest["content_digest"],
                      canonical.dumps(manifest).decode("utf-8"), set_id))
                 self._conn.commit()
-                # Subject-name index sidecar (content-addressed in set dir).
+                # Subject-name + identity index sidecar (content-addressed
+                # in set dir).
                 import os as _os
 
                 idx_path = _os.path.join(self.root, "packages", f"{set_id}.nameindex.json")
                 tmp = idx_path + ".tmp"
                 with open(tmp, "w") as f:
-                    f.write(canonical.dumps(name_index).decode("utf-8"))
+                    f.write(canonical.dumps(sidecar).decode("utf-8"))
                 _os.replace(tmp, idx_path)
                 return manifest
             except Exception:

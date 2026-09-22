@@ -47,9 +47,17 @@ class CertGraph:
         out: list[ParsedCert] = []
         for fp in self.by_name.get(name_der, []):
             pc = self.certs[fp]
-            if aki is not None and pc.ski is not None and pc.ski != aki:
+            if aki is None or pc.ski is None or pc.ski == aki:
+                out.append(pc)
                 continue
-            out.append(pc)
+            # Same-key cross-sign: keep when a same-name cert sharing this
+            # key is itself AKI-compatible (mirrors candidate scoping).
+            for fp2 in self.by_name_key.get((name_der, pc.spki_bitstring), ()):
+                other = self.certs.get(fp2)
+                if other is not None and (
+                        other.ski is None or other.ski == aki):
+                    out.append(pc)
+                    break
         return out
 
     def edge(self, child_fp: str, issuer_fp: str) -> Edge:
@@ -59,11 +67,8 @@ class CertGraph:
             return cached
         child = self.certs[child_fp]
         issuer = self.certs[issuer_fp]
-        name_key_ok = (
-            child.issuer_der == issuer.subject_der
-            and (child.aki is None or issuer.ski is None
-                 or child.aki == issuer.ski)
-        )
+        name_key_ok = child.issuer_der == issuer.subject_der and (
+            self._aki_compatible(child, issuer))
         if not name_key_ok:
             e = Edge(child_fp, issuer_fp, False, "ISSUER_NAME_KEY", False)
         else:
@@ -71,6 +76,29 @@ class CertGraph:
             e = Edge(child_fp, issuer_fp, ok, rule, True)
         self._edge_cache[key] = e
         return e
+
+    def _aki_compatible(self, child: ParsedCert, issuer: ParsedCert) -> bool:
+        """RFC 5280 name/AKI identity, with the same-key cross-sign rule.
+
+        A candidate is name/key-compatible when it has no SKI, the child has
+        no AKI, or its SKI equals the child's AKI. It is ALSO compatible when
+        a different certificate with the *same public key* satisfies that
+        test: cross-signs of one key under several issuers may carry
+        different SKI values, and AKI scoping must not lose them. Only
+        certificates the cheap identity index already tied to this key reach
+        this point, so this never re-expands to AKI-mismatched decoys.
+        """
+        if child.aki is None or issuer.ski is None or child.aki == issuer.ski:
+            return True
+        for fp2 in self.by_name_key.get(
+                (issuer.subject_der, issuer.spki_bitstring), ()):
+            if fp2 == issuer.fingerprint:
+                continue
+            other = self.certs.get(fp2)
+            if other is not None and (
+                    other.ski is None or other.ski == child.aki):
+                return True
+        return False
 
     def candidate_issuers(self, child_fp: str) -> list[str]:
         """Name/key-compatible issuers, signature not necessarily valid yet."""
