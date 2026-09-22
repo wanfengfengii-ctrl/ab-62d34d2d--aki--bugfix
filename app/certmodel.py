@@ -32,6 +32,8 @@ from .errors import (
 OID_POLICY_MAPPINGS = "2.5.29.33"
 OID_POLICY_CONSTRAINTS = "2.5.29.36"
 OID_INHIBIT_ANY_POLICY = "2.5.29.54"
+OID_SKI_EXT = "2.5.29.14"
+OID_AKI_EXT = "2.5.29.35"
 OID_CPS = "1.3.6.1.5.5.7.2.1"
 OID_USER_NOTICE = "1.3.6.1.5.5.7.2.2"
 OID_RSA_PSS = "1.2.840.113549.1.1.10"
@@ -547,6 +549,115 @@ def cheap_names(cert_der: bytes) -> tuple[bytes, bytes]:
     issuer = der.build_tlv(t[i + 2][0], t[i + 2][1])
     subject = der.build_tlv(t[i + 4][0], t[i + 4][1])
     return issuer, subject
+
+
+@dataclasses.dataclass(frozen=True)
+class CheapIdentity:
+    """Issuer-identification material extracted from raw DER with *no*
+    cryptographic parsing: Name DERs, AKI/SKI key identifiers and a digest of
+    the subjectPublicKey BIT STRING. Enough to prefilter same-subject issuer
+    buckets without a full (x509/profile/signature-ready) parse."""
+
+    subject_der: bytes
+    issuer_der: bytes
+    ski: bytes | None
+    aki: bytes | None
+    spki_key_id: str  # sha256 hex of the subjectPublicKey key bytes
+
+
+def _walk_tbs_fields(tbs_body: bytes):
+    """Return (top-level TBSCertificate fields, start index), skipping the
+    optional explicit version [0]."""
+    fields = list(der.iter_tlv(tbs_body))
+    start = 1 if fields and fields[0][0] == 0xA0 else 0
+    return fields, start
+
+
+def _ext_key_id(ext_value: bytes, oid: str) -> bytes | None:
+    """Extract the keyIdentifier from a SubjectKeyIdentifier (OID 2.5.29.14)
+    or an AuthorityKeyIdentifier (OID 2.5.29.35) extnValue payload. Returns
+    None when the extension carries no keyIdentifier."""
+    inner_tag, inner_body, _ = der.tlv(ext_value)
+    if oid == OID_SKI_EXT:
+        # SubjectKeyIdentifier ::= OCTET STRING
+        if inner_tag != der.OCTET_STRING:
+            raise MalformedEvidenceError("subjectKeyIdentifier: expected OCTET STRING")
+        return inner_body
+    # AuthorityKeyIdentifier ::= SEQUENCE; keyIdentifier is [0] primitive.
+    if inner_tag != der.SEQUENCE:
+        raise MalformedEvidenceError("authorityKeyIdentifier: expected SEQUENCE")
+    for ftag, fval in der.iter_tlv(inner_body):
+        if ftag == 0x80:
+            return bytes(fval)
+    return None
+
+
+def cheap_identity(cert_der: bytes) -> CheapIdentity:
+    """Extract issuer-filtering identity straight from DER without loading a
+    cryptographic library object. Raises MalformedEvidenceError on structurally
+    broken DER, exactly like :func:`cheap_names`."""
+    tag, body, _ = der.tlv(cert_der)
+    if tag != der.SEQUENCE:
+        raise MalformedEvidenceError("certificate: expected SEQUENCE")
+    elems = list(der.iter_tlv(body))
+    if not elems:
+        raise MalformedEvidenceError("certificate: truncated")
+    tbs_tag, tbs_body = elems[0]
+    if tbs_tag != der.SEQUENCE:
+        raise MalformedEvidenceError("certificate: bad TBS")
+    fields, start = _walk_tbs_fields(tbs_body)
+    # serial start, signature +1, issuer +2, validity +3, subject +4, SPKI +5
+    if len(fields) < start + 6:
+        raise MalformedEvidenceError("certificate: truncated TBS")
+    issuer = der.build_tlv(fields[start + 2][0], fields[start + 2][1])
+    subject = der.build_tlv(fields[start + 4][0], fields[start + 4][1])
+    spki_tag, spki_body = fields[start + 5]
+    if spki_tag != der.SEQUENCE:
+        raise MalformedEvidenceError("certificate: bad SubjectPublicKeyInfo")
+    spki_fields = list(der.iter_tlv(spki_body))
+    if len(spki_fields) < 2 or spki_fields[1][0] != der.BIT_STRING:
+        raise MalformedEvidenceError("certificate: bad subjectPublicKey")
+    bitval = spki_fields[1][1]
+    if not bitval:
+        raise MalformedEvidenceError("certificate: empty subjectPublicKey")
+    key_bytes = bitval[1:]  # strip unused-bits octet
+    spki_key_id = hashlib.sha256(key_bytes).hexdigest()
+
+    ski: bytes | None = None
+    aki: bytes | None = None
+    # Extensions live in explicit [3] after issuerUniqueID [1]/subjectUniqueID [2].
+    # Extension scanning is best-effort: the Name/SPKI skeleton above is the
+    # strict, identity-bearing part (identical baseline to cheap_names); a
+    # structurally odd extension must not make the certificate vanish from an
+    # issuer bucket — it degrades to "no SKI/AKI" (the inclusive compatibility
+    # direction) and the authoritative full parse rejects it later if needed.
+    for ftag, fval in fields[start + 6:]:
+        if ftag != 0xA3:
+            continue
+        try:
+            _, seq_body, _ = der.tlv(fval)
+            for etag, eval_ in der.iter_tlv(seq_body):
+                if etag != der.SEQUENCE:
+                    raise MalformedEvidenceError("extension: expected SEQUENCE")
+                eparts = list(der.iter_tlv(eval_))
+                if len(eparts) < 2 or eparts[0][0] != der.OID:
+                    raise MalformedEvidenceError("extension: bad structure")
+                ext_oid = der.decode_oid(eparts[0][1])
+                # parts: OID, [critical BOOLEAN], extnValue OCTET STRING
+                val_tag, val_inner = eparts[-1]
+                if val_tag != der.OCTET_STRING:
+                    raise MalformedEvidenceError(
+                        "extension: extnValue must be OCTET STRING")
+                if ext_oid == OID_SKI_EXT:
+                    ski = _ext_key_id(val_inner, ext_oid)
+                elif ext_oid == OID_AKI_EXT:
+                    aki = _ext_key_id(val_inner, ext_oid)
+        except MalformedEvidenceError:
+            # Keep Name/key identity; treat unreadable SKI/AKI as absent.
+            ski, aki = None, None
+        break
+    return CheapIdentity(subject_der=subject, issuer_der=issuer,
+                         ski=ski, aki=aki, spki_key_id=spki_key_id)
 
 
 def is_self_signed(pc: ParsedCert) -> bool:

@@ -166,7 +166,8 @@ def _result(manifest, req, request_digest, anchor_checks, loaded,
         "policy_trace": [],
         "revocation_results": [],
         "revocation_snapshot": [],
-        "path_search": {"explored_edges": [], "node_failures": []},
+        "path_search": {"explored_edges": [], "node_failures": [],
+                        "certificates_fully_parsed": 0},
     }
 
     if early is not None:
@@ -221,6 +222,7 @@ def _result(manifest, req, request_digest, anchor_checks, loaded,
                 "failure": None if art.get("ok") else art.get("rule")},
         }
 
+    result["path_search"]["certificates_fully_parsed"] = loaded.full_parse_count
     result["verdict"] = verdict
     result["evidence_disposition"] = {"parse_rejected": loaded.parse_problems}
     result["evidence_manifest"] = {

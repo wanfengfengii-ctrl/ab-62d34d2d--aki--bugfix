@@ -54,12 +54,45 @@ class ZipLoadedSet(LoadedSet):
     def _name_index_path(self) -> str:
         return ""  # unused
 
-    def _subject_name_index(self) -> dict[bytes, list[str]]:
-        import base64 as b64
+    def identity_catalog(self):
+        """Build the exact same cheap AKI-aware catalog from packaged DER as
+        the online service builds at seal time, so path search filters
+        identically during offline recomputation."""
+        from app.certmodel import cheap_identity
+        from app.loader import IdentityCatalog
+        from app.errors import MalformedEvidenceError
 
+        cached = getattr(self, "_catalog", None)
+        if cached is not None:
+            return cached
+        raw: dict[bytes, list[dict]] = {}
+        for d in self.content["certificates"]:
+            try:
+                ident = cheap_identity(self.get_blob(d))
+            except (MalformedEvidenceError, KeyError):
+                continue
+            raw.setdefault(ident.subject_der, []).append({
+                "d": d,
+                "s": (base64.b64encode(ident.ski).decode()
+                      if ident.ski is not None else None),
+                "k": ident.spki_key_id})
+        for entries in raw.values():
+            entries.sort(key=lambda e: e["d"])
+
+        def resolve(digest):
+            try:
+                return cheap_identity(self.get_blob(digest))
+            except (MalformedEvidenceError, KeyError):
+                return None
+
+        catalog = IdentityCatalog(raw, resolve)
+        self._catalog = catalog
+        return catalog
+
+    def _subject_name_index(self) -> dict[bytes, list[str]]:
         idx: dict[bytes, list[str]] = {}
-        for name_b64, digests in self.store._name_index.items():
-            idx[b64.b64decode(name_b64)] = digests
+        for name_der, entries in self.identity_catalog()._raw.items():
+            idx[name_der] = [e["d"] for e in entries]
         return idx
 
 
@@ -151,21 +184,14 @@ def verify_package(path: str) -> dict:
     rerun_ok = False
     rerun_detail = ""
     try:
-        # Build a name index from packaged certs via cheap DER extraction.
-        from app.certmodel import cheap_names
-        from app.errors import MalformedEvidenceError
-
-        name_index: dict[str, list[str]] = {}
+        # The sealed content universe is restricted to the packaged subset;
+        # the AKI-aware identity catalog is rebuilt straight from those DER
+        # (see ZipLoadedSet.identity_catalog), so path search filters exactly
+        # as it did online.
         cert_digests = set_manifest["content"]["certificates"]
         cert_files = {d: files[f"der/certificates/{d}.der"]
                       for d in cert_digests
                       if f"der/certificates/{d}.der" in files}
-        for d, raw in cert_files.items():
-            try:
-                _i, subject = cheap_names(raw)
-            except MalformedEvidenceError:
-                continue
-            name_index.setdefault(base64.b64encode(subject).decode(), []).append(d)
 
         # The core must see exactly the sealed content universe; certificates
         # not bundled (unrelated 100k) are irrelevant: restrict content lists
@@ -183,7 +209,7 @@ def verify_package(path: str) -> dict:
                 "ocsps": set_manifest["content"]["ocsps"],
             },
         }
-        source = ZipSource(files, name_index)
+        source = ZipSource(files, {})
         loaded = ZipLoadedSet(source, rerun_manifest)
         rerun = run_core(loaded, rerun_manifest, req)
         # Determinism: recomputed result must byte-match result.json after

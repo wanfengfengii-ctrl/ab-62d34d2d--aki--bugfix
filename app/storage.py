@@ -274,20 +274,30 @@ class Store:
                     raise ConflictError("resource limit exceeded",
                                         {"limit": "crl_ocsp_evidence", "max": 2_000,
                                          "actual": n_rev})
-                # Cheap subject-name index for lazy graph construction.
+                # Cheap issuer-identity index for lazy, AKI-aware graph
+                # construction: subject Name -> [{digest, SKI, public-key id}].
+                # Everything is extracted straight from raw DER (no crypto).
                 import base64
 
-                from .certmodel import cheap_names
+                from .certmodel import cheap_identity
                 from .errors import MalformedEvidenceError
 
-                name_index: dict[str, list[str]] = {}
+                name_index: dict[str, list[dict]] = {}
                 for x in groups["certificate"]:
                     d = x["sha256"]
                     try:
-                        _issuer, subject = cheap_names(self.get_blob(d))
+                        ident = cheap_identity(self.get_blob(d))
                     except MalformedEvidenceError:
                         continue
-                    name_index.setdefault(base64.b64encode(subject).decode(), []).append(d)
+                    entry = {"d": d,
+                             "s": (base64.b64encode(ident.ski).decode()
+                                   if ident.ski is not None else None),
+                             "k": ident.spki_key_id}
+                    name_index.setdefault(
+                        base64.b64encode(ident.subject_der).decode(),
+                        []).append(entry)
+                for entries in name_index.values():
+                    entries.sort(key=lambda e: e["d"])
                 total_revocation_entries = 0
                 for x in groups["crl"]:
                     from cryptography import x509 as _x509
@@ -320,14 +330,29 @@ class Store:
                     (manifest["content_digest"],
                      canonical.dumps(manifest).decode("utf-8"), set_id))
                 self._conn.commit()
-                # Subject-name index sidecar (content-addressed in set dir).
+                # Identity sidecars (content-addressed in the set dir). The
+                # v1 name-only index is kept for readers sealed by older
+                # builds; v2 adds per-cert SKI + public-key id so adjudications
+                # can AKI-prefilter same-subject buckets without parsing DER.
                 import os as _os
 
-                idx_path = _os.path.join(self.root, "packages", f"{set_id}.nameindex.json")
-                tmp = idx_path + ".tmp"
+                packages_dir = _os.path.join(self.root, "packages")
+                v1_index = {
+                    name: [e["d"] for e in entries]
+                    for name, entries in name_index.items()}
+                v1_path = _os.path.join(packages_dir, f"{set_id}.nameindex.json")
+                tmp = v1_path + ".tmp"
                 with open(tmp, "w") as f:
-                    f.write(canonical.dumps(name_index).decode("utf-8"))
-                _os.replace(tmp, idx_path)
+                    f.write(canonical.dumps(v1_index).decode("utf-8"))
+                _os.replace(tmp, v1_path)
+
+                v2_doc = {"version": 2, "names": name_index}
+                v2_path = _os.path.join(
+                    packages_dir, f"{set_id}.identity.v2.json")
+                tmp = v2_path + ".tmp"
+                with open(tmp, "w") as f:
+                    f.write(canonical.dumps(v2_doc).decode("utf-8"))
+                _os.replace(tmp, v2_path)
                 return manifest
             except Exception:
                 self._conn.rollback()

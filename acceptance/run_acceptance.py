@@ -219,6 +219,107 @@ def main() -> int:
                 check("offline verifier passes without network",
                       offline_ok, str(fails)[:300])
 
+    # ----------------- AKI-scoped same-subject decoy scaling -------------
+    # 256 self-signed-in-name decoy CAs share the real CA's subject DN but
+    # carry distinct keys/SKIs; the leaf's AKI names the real CA. The verdict
+    # must stay VALID and the full-parse count must remain constant (root,
+    # real CA, leaf), independent of the decoy population.
+    ark, ack, alk = pf.gen_key(), pf.gen_key(), pf.gen_key()
+    aroot = pf.build_cert("AKI Root", None, ark, ark, is_ca=True,
+                          key_usage=("keyCertSign", "cRLSign"),
+                          policies=[ANY], self_signed=True)
+    aca = pf.build_cert("AKI Target CA", aroot, ack, ark, is_ca=True,
+                        key_usage=("keyCertSign", "cRLSign"), policies=[ANY])
+    aleaf = pf.build_cert("aki.leaf", aca, alk, ack,
+                          key_usage=("digitalSignature",),
+                          eku=("codeSigning",), policies=[ANY],
+                          san_dns=("aki.leaf",))
+    adecoys = []
+    for _ in range(256):
+        dk = pf.gen_key()
+        adecoys.append(pf.build_cert(
+            "AKI Target CA", aroot, dk, ark, is_ca=True,
+            key_usage=("keyCertSign", "cRLSign"), policies=[ANY]))
+    acrl = pf.build_crl(aca, ack, [], last_update=SIGNED - 100,
+                        next_update=SIGNED + 100, crl_number=1)
+    arcrl = pf.build_crl(aroot, ark, [], last_update=SIGNED - 100,
+                         next_update=SIGNED + 100, crl_number=1)
+
+    r = httpx.post(API1 + "/api/v1/evidence-sets",
+                   json={"client_request_id": "aki-create"})
+    asid = r.json()["evidence_set_id"]
+    aitems = [
+        {"client_ref": "aroot", "type": "certificate", "content_base64": b64(aroot)},
+        {"client_ref": "aca", "type": "certificate", "content_base64": b64(aca)},
+        {"client_ref": "aleaf", "type": "certificate", "content_base64": b64(aleaf)}]
+    aitems += [{"client_ref": f"decoy-{i:03d}", "type": "certificate",
+                "content_base64": b64(c)} for i, c in enumerate(adecoys)]
+    aitems += [
+        {"client_ref": "acrl", "type": "crl", "content_base64": b64(acrl)},
+        {"client_ref": "arcrl", "type": "crl", "content_base64": b64(arcrl)}]
+    r = httpx.post(f"{API1}/api/v1/evidence-sets/{asid}/items",
+                   json={"client_request_id": "aki-items",
+                         "received_at": RECEIVED, "items": aitems})
+    check("256 same-subject decoy CAs upload (261 items)",
+          r.status_code == 200 and r.json()["accepted"] == 261, r.text[:200])
+    r = httpx.post(f"{API2}/api/v1/evidence-sets/{asid}/seal",
+                   json={"client_request_id": "aki-seal"})
+    check("AKI decoy set sealed on api2", r.status_code == 200)
+
+    adigest = hashlib.sha256(b"aki-artifact").digest()
+    asig = alk.sign(adigest, ec.ECDSA(Prehashed(hashes.SHA256())))
+    areq = {"client_request_id": "aki-adj",
+            "artifact_digest": adigest.hex(), "signature": asig.hex(),
+            "signature_algorithm": "1.2.840.10045.4.3.2",
+            "signed_at": SIGNED, "knowledge_cutoff": CUTOFF,
+            "leaf_certificate_sha256": fp_of(pf.der(aleaf)),
+            "initial_policies": [ANY], "trust_anchors": [fp_of(pf.der(aroot))]}
+    r = httpx.post(f"{API1}/api/v1/evidence-sets/{asid}/adjudications",
+                   json=areq)
+    body = r.json() if r.status_code == 201 else {}
+    fully_parsed = (body.get("path_search") or {}).get(
+        "certificates_fully_parsed")
+    check("256 AKI-mismatched decoys: VALID, constant full-parse count",
+          r.status_code == 201
+          and body.get("verdict", {}).get("status") == "VALID"
+          and fully_parsed == 3,
+          f"status={body.get('verdict', {}).get('status')} "
+          f"fully_parsed={fully_parsed}")
+
+    # Cross-instance read (shared volume) must be byte-identical, and the
+    # package must pass the fully offline verifier (same semantics offline).
+    if r.status_code == 201:
+        aid = body["adjudication_id"]
+        r_other = httpx.get(
+            f"{API2}/api/v1/evidence-sets/{asid}/adjudications/{aid}")
+        check("AKI adjudication byte-identical on api2",
+              r_other.status_code == 200 and r_other.content == r.content)
+        rp = httpx.get(f"{API2}/api/v1/evidence-sets/{asid}/packages/{aid}")
+        aki_offline_ok = False
+        if rp.status_code == 200 and rp.content[:2] == b"PK":
+            with tempfile.TemporaryDirectory() as td:
+                p = os.path.join(td, "aki.zip")
+                with open(p, "wb") as f:
+                    f.write(rp.content)
+                env = dict(os.environ)
+                for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy",
+                            "https_proxy", "ALL_PROXY", "all_proxy"):
+                    env[var] = "http://127.0.0.1:9"
+                proc = subprocess.run(
+                    [sys.executable, "-m", "verify", p, "--json"],
+                    capture_output=True, text=True, env=env, timeout=120)
+                try:
+                    import json as _json
+                    rep = _json.loads(proc.stdout)
+                    aki_offline_ok = proc.returncode == 0 and rep["ok"]
+                    fails = [c for c in rep["checks"] if not c["ok"]]
+                except Exception:
+                    fails = [{"check": proc.stderr[:300]}]
+        else:
+            fails = [{"check": "package download failed"}]
+        check("AKI decoy package offline-verified", aki_offline_ok,
+              str(fails)[:300])
+
     # --------------------------- structured UNSUPPORTED ------------------
     from cryptography.hazmat.primitives.asymmetric import ec as _ec
 
